@@ -1,0 +1,138 @@
+# PiBrowse — Windows build (GitHub Actions)
+#
+# Why this file exists: PiBrowse 0.5.5 ships macOS Apple Silicon only.
+# The release notes say so explicitly: "no Windows or Intel Mac binary".
+# But the source already has everything a Windows build needs:
+#   - desktop/src-tauri/tauri.conf.json: productName PiBrowse, bundle
+#     targets app/dmg/nsis, Windows NSIS config (currentUser install,
+#     icon, header/sidebar images, hooks.nsh)
+#   - desktop/scripts/sidecar.mjs: builds fury-agent and places it as the
+#     Tauri sidecar; it was rewritten in Node precisely so `tauri build`
+#     works on Windows (cmd.exe cannot run the old sidecar.sh)
+#   - tools/release/collect-windows.sh: expects
+#     target/release/bundle/nsis/PiBrowse_<version>_x64-setup.exe
+#   - docs/15-install.md (Windows): "Use the Windows build listed on
+#     PiBrowse Releases" + the compatible upstream Windows core is
+#     fury-core-<version>-windows-x64.tar.xz from Fury releases
+#
+# What this does NOT do: rebuild the Chromium core. A core build is
+# ~38 GB / ~6 hours and GitHub hosted runners have ~14 GB disk and a
+# 6-hour job limit (the repo's own ci.yml says so). It is also not
+# needed: PiBrowse 0.5.5 and Fury 0.5.3 both pin Chromium 157.0.8103.39
+# (core/CHROMIUM_VERSION), and PiBrowse's own docs bless the upstream
+# Fury Windows core. This workflow builds the app (shell + agent),
+# verifies the Fury 0.5.3 core's SHA-256, and smoke-tests install-core.
+#
+# How to use:
+#   1. Fork https://github.com/aronhy/pibrowse on GitHub.
+#   2. Put this file at .github/workflows/windows-build.yml in the fork.
+#   3. Actions -> "PiBrowse Windows build" -> Run workflow.
+#      (Leave ref at v0.5.5 unless you want main.)
+#   4. When it finishes, download the "pibrowse-windows-0.5.5" artifact:
+#      PiBrowse_0.5.5_x64-setup.exe (unsigned — SmartScreen will ask
+#      More info -> Run anyway).
+#   5. On Windows, install it, then install the core once, in PowerShell:
+#        & "$env:LOCALAPPDATA\PiBrowse\fury-agent.exe" install-core `
+#          "$env:USERPROFILE\Downloads\fury-core-0.5.3-windows-x64.tar.xz"
+#      (download that file from
+#       https://github.com/furyteamtop/fury-antidetect-browser/releases/tag/v0.5.3)
+#      Or open PiBrowse and press "Download the browser" — it looks in
+#      PiBrowse's releases first, so if that finds no Windows core there,
+#      use the manual command above.
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+name: PiBrowse Windows build
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Tag or branch to build (default v0.5.5)"
+        required: false
+        default: "v0.5.5"
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: PiBrowse Windows installer
+    runs-on: windows-latest
+    steps:
+      - name: Check out PiBrowse
+        uses: actions/checkout@v4
+        with:
+          repository: aronhy/pibrowse
+          ref: ${{ inputs.ref }}
+
+      - name: Set up Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      - name: Set up Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install frontend dependencies
+        run: npm ci
+        working-directory: desktop
+
+      - name: Frontend tests
+        run: npm test
+        working-directory: desktop
+
+      # beforeBuildCommand in tauri.conf.json runs
+      # `node scripts/sidecar.mjs && npm run build` first: the sidecar
+      # script builds fury-agent for the host triple and places it where
+      # the bundler expects it. --bundles nsis only: the default build
+      # also tries dmg, which cannot be made on Windows.
+      - name: Build the Windows installer
+        run: npx tauri build --bundles nsis
+        working-directory: desktop
+
+      - name: Show the installer
+        shell: pwsh
+        run: |
+          Get-ChildItem target/release/bundle/nsis/ | Format-Table Name, Length
+          if (-not (Test-Path target/release/bundle/nsis/PiBrowse_0.5.5_x64-setup.exe)) {
+            Write-Error "installer not found at the expected path"
+          }
+
+      # Smoke test: silent-install it, then check the agent answers.
+      # The installer is per-user (installMode: currentUser), no admin.
+      - name: Smoke test the installer
+        shell: pwsh
+        run: |
+          Start-Process -Wait -FilePath target/release/bundle/nsis/PiBrowse_0.5.5_x64-setup.exe -ArgumentList "/S"
+          Test-Path "$env:LOCALAPPDATA\PiBrowse\fury-desktop.exe" | Out-String
+          & "$env:LOCALAPPDATA\PiBrowse\fury-agent.exe" --version
+
+      # The core is not rebuilt (see header). Verify the compatible
+      # upstream Fury 0.5.3 Windows core instead: same Chromium
+      # 157.0.8103.39, SHA-256 from Fury's published SHA256SUMS.
+      - name: Verify the compatible Fury Windows core
+        shell: pwsh
+        run: |
+          $url = "https://github.com/furyteamtop/fury-antidetect-browser/releases/download/v0.5.3/fury-core-0.5.3-windows-x64.tar.xz"
+          Invoke-WebRequest -Uri $url -OutFile fury-core-0.5.3-windows-x64.tar.xz
+          $hash = (Get-FileHash fury-core-0.5.3-windows-x64.tar.xz -Algorithm SHA256).Hash.ToLower()
+          if ($hash -ne "af9d5559ca1e147bad8123a5c41d68d3a12cc15357901ffdd8ddc46333f3cae4") {
+            Write-Error "core SHA-256 mismatch: $hash"
+          }
+          Write-Host "core SHA-256 OK: $hash"
+          & "$env:LOCALAPPDATA\PiBrowse\fury-agent.exe" install-core "$PWD\fury-core-0.5.3-windows-x64.tar.xz"
+          # install-core itself probes the core and fails if it will not
+          # run; just list where it landed for the log, do not guess the
+          # exact directory name here.
+          Get-ChildItem "$env:LOCALAPPDATA\PiBrowse" -Recurse -Filter chrome.exe -ErrorAction SilentlyContinue | Select-Object FullName | Out-String
+
+      - name: Upload the installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: pibrowse-windows-0.5.5
+          path: target/release/bundle/nsis/PiBrowse_0.5.5_x64-setup.exe
+          if-no-files-found: error
+          retention-days: 30
