@@ -63,11 +63,17 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 90
     steps:
-      # No `repository:` pin: checkout builds the repo the workflow runs
-      # in (the fork). Pinning upstream would silently test upstream code.
+      # Source checkout pins upstream aronhy/pibrowse: the release tags
+      # (v0.5.5) exist ONLY upstream — the fork carries no tags, so checking
+      # out ref v0.5.5 from the fork fails (run #1 died at this step in 56s).
+      # The workflow file itself is loaded by Actions from the fork branch
+      # chosen at dispatch, so this step only chooses the SOURCE tree to
+      # build and test. To test fork-only changes, dispatch with a ref that
+      # exists in the fork and remove the repository pin.
       - name: Check out PiBrowse
         uses: actions/checkout@v4
         with:
+          repository: aronhy/pibrowse
           ref: ${{ inputs.ref }}
 
       - name: Set up Node 22
