@@ -1,0 +1,510 @@
+# PiBrowse — Windows deep test (GitHub Actions)
+#
+# The real-Windows end-to-end test for PiBrowse v0.5.5: build the installer,
+# install it, install the browser core, run the repo's own Windows verifier,
+# then actually launch a stored profile's browser and drive it — local
+# fingerprint probe (detect-suite) plus public fingerprint checkers — and
+# upload every log, dump and screenshot as artifacts.
+#
+# What this proves (and what it does not — see
+# audit/deep-test/windows-test-plan.md for the full plan):
+#   - the installer builds, installs silently, and its agent answers
+#   - the Fury 0.5.3 core installs and the core binary is real
+#   - verify-windows.ps1's claims: named-pipe DACL/owner, five sequential
+#     clients, second-agent refusal, data-dir ACL, vault key, and the
+#     persona reaching the core as an inherited HANDLE with nothing in argv
+#   - a stored Windows profile opens in a real window, navigates, and its
+#     fingerprint is internally consistent (fury-detect gate + spoof diff)
+#   - public checkers are captured (screenshot + page text) as evidence
+#
+# What it does NOT prove:
+#   - public-checker verdicts are NOT gated on. The runner has a
+#     datacenter IP and the test profile opens with no proxy (see below),
+#     so an IP<->timezone mismatch is a property of the test setup, not
+#     of PiBrowse. Verdicts are recorded, never used to pass/fail the job.
+#   - verify-windows.ps1 tests the agent binary from the build tree
+#     (target\release\fury-agent.exe), not the installed PiBrowse app.
+#     The installed app is checked separately by launching fury-desktop.exe.
+#   - no human watches the window; visual defects only show up in the
+#     screenshots if somebody looks at them.
+#
+# Proxy note — read this before "fixing" it. A stored profile normally
+# needs a proxy to open (agent/src/ipc.rs:2920 refuses a proxy-less launch
+# unless the profile allows it). The test profile is created with
+# allow_no_proxy=true so it opens direct from the runner's own IP: there
+# is no test proxy to give it, and a dead proxy (as verify-windows.ps1
+# uses for its launch section) would make every page load fail. That is
+# also why the public checkers are capture-only (see above).
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+name: PiBrowse Windows deep test
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Tag or branch to build and test (default v0.5.5)"
+        required: false
+        default: "v0.5.5"
+
+permissions:
+  contents: read
+
+env:
+  CORE_URL: https://github.com/furyteamtop/fury-antidetect-browser/releases/download/v0.5.3/fury-core-0.5.3-windows-x64.tar.xz
+  CORE_SHA256: af9d5559ca1e147bad8123a5c41d68d3a12cc15357901ffdd8ddc46333f3cae4
+  TEST_PROFILE_NAME: DeepTest-Windows
+  TEST_PERSONA: windows-11-rtx4060-1920x1080
+
+jobs:
+  deep-test:
+    name: PiBrowse Windows deep test
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      # No `repository:` pin: checkout builds the repo the workflow runs
+      # in (the fork). Pinning upstream would silently test upstream code.
+      - name: Check out PiBrowse
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Set up Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      - name: Set up Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install frontend dependencies
+        run: npm ci
+        working-directory: desktop
+
+      - name: Frontend tests
+        run: npm test
+        working-directory: desktop
+
+      # fury-detect is the release gate: `gate` checks one dump for
+      # internal contradictions, `diff --mode spoof` compares it against
+      # a real-Chrome baseline. Both exit non-zero on failure.
+      - name: Build fury-detect
+        run: cargo build --release -p fury-detect
+
+      # beforeBuildCommand in tauri.conf.json runs
+      # `node scripts/sidecar.mjs && npm run build` first: the sidecar
+      # script builds fury-agent for the host triple and places it where
+      # the bundler expects it. --bundles nsis only: the default build
+      # also tries dmg, which cannot be made on Windows.
+      - name: Build the Windows installer
+        timeout-minutes: 30
+        run: npx tauri build --bundles nsis
+        working-directory: desktop
+
+      # The installer name comes from the package version, so derive it
+      # from what was actually built rather than hardcoding a version:
+      # exactly one *-setup.exe must exist, and the version is read from
+      # Cargo.toml ([workspace.package]).
+      - name: Locate the installer
+        id: installer
+        shell: pwsh
+        run: |
+          $installers = @(Get-ChildItem target/release/bundle/nsis/*-setup.exe -ErrorAction SilentlyContinue)
+          if ($installers.Count -ne 1) {
+            Write-Error "expected exactly one installer in target/release/bundle/nsis, found $($installers.Count)"
+          }
+          $name = $installers[0].Name
+          $cargo = Get-Content Cargo.toml -Raw
+          if ($cargo -notmatch '(?ms)\[workspace\.package\].*?^version\s*=\s*"([^"]+)"') {
+            Write-Error "could not read a version from Cargo.toml"
+          }
+          $version = $Matches[1]
+          "name=$name" >> $env:GITHUB_OUTPUT
+          "version=$version" >> $env:GITHUB_OUTPUT
+          Write-Host "installer: $name (version $version)"
+          New-Item -ItemType Directory -Path test-results -Force | Out-Null
+          (Get-FileHash "target/release/bundle/nsis/$name" -Algorithm SHA256).Hash.ToLower() |
+            Out-File test-results/installer-sha256.txt -Encoding ascii
+
+      # Silent install, then check the installed app and agent exist.
+      # The installer is per-user (installMode: currentUser), no admin.
+      # NOTE: `fury-agent --version` is not a real subcommand — it prints
+      # usage and exits 0 (found by the test audit). So this step asserts
+      # only that the agent runs and prints something, not a version
+      # string; do not "fix" it into a version assertion without first
+      # checking what --version actually prints.
+      - name: Install PiBrowse and check the installed files
+        shell: pwsh
+        run: |
+          Start-Process -Wait -FilePath "target/release/bundle/nsis/${{ steps.installer.outputs.name }}" -ArgumentList "/S"
+          if (-not (Test-Path "$env:LOCALAPPDATA\PiBrowse\fury-desktop.exe")) {
+            Write-Error "fury-desktop.exe not found after install"
+          }
+          if (-not (Test-Path "$env:LOCALAPPDATA\PiBrowse\fury-agent.exe")) {
+            Write-Error "fury-agent.exe not found after install"
+          }
+          $versionOutput = & "$env:LOCALAPPDATA\PiBrowse\fury-agent.exe" --version 2>&1 | Out-String
+          if ($LASTEXITCODE -ne 0 -or $versionOutput.Trim().Length -eq 0) {
+            Write-Error "installed fury-agent --version failed or printed nothing"
+          }
+          Write-Host $versionOutput
+
+      # The desktop shell itself: it must start and stay up. WebView2 is
+      # preinstalled on windows-latest. If the shell cannot create a
+      # window on the runner this is the step to revisit — but a browser
+      # whose window never opens is a real failure, so it fails the job.
+      - name: Launch the installed PiBrowse window
+        shell: pwsh
+        run: |
+          $app = Start-Process -FilePath "$env:LOCALAPPDATA\PiBrowse\fury-desktop.exe" -PassThru -WindowStyle Normal
+          Start-Sleep -Seconds 20
+          if ($app.HasExited) {
+            Write-Error "fury-desktop.exe exited within 20s of starting (exit code $($app.ExitCode))"
+          }
+          Write-Host "fury-desktop.exe running as PID $($app.Id)"
+          $app | Stop-Process -Force
+          $app.WaitForExit(10000) | Out-Null
+          # The shell may have started its own agent on the shared pipe;
+          # stop any agent it left behind so the test agent below owns it.
+          Get-Process -Name fury-agent -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 3
+
+      # The core is not rebuilt (see the build workflow's header: ~38 GB
+      # / ~6 h, beyond a hosted runner). Verify the compatible upstream
+      # Fury 0.5.3 Windows core instead: same Chromium 157.0.8103.39,
+      # SHA-256 from Fury's published SHA256SUMS.
+      - name: Download and verify the Fury Windows core
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri $env:CORE_URL -OutFile fury-core-0.5.3-windows-x64.tar.xz
+          $hash = (Get-FileHash fury-core-0.5.3-windows-x64.tar.xz -Algorithm SHA256).Hash.ToLower()
+          if ($hash -ne $env:CORE_SHA256) {
+            Write-Error "core SHA-256 mismatch: $hash"
+          }
+          Write-Host "core SHA-256 OK: $hash"
+
+      # install-core puts the core in the DATA directory,
+      # %APPDATA%\Fury\core.bundle — not under the install directory in
+      # %LOCALAPPDATA%. Fail if chrome.exe is in none of the known places.
+      - name: Install the core into the installed app
+        shell: pwsh
+        run: |
+          & "$env:LOCALAPPDATA\PiBrowse\fury-agent.exe" install-core "$PWD\fury-core-0.5.3-windows-x64.tar.xz"
+          if ($LASTEXITCODE -ne 0) { Write-Error "install-core failed with exit code $LASTEXITCODE" }
+          $candidates = @(
+            "$env:APPDATA\Fury\core.bundle\Fury\chrome.exe",
+            "$env:APPDATA\Fury\core\Fury\chrome.exe",
+            "$env:LOCALAPPDATA\PiBrowse\core.bundle\Fury\chrome.exe"
+          )
+          $found = $candidates | Where-Object { Test-Path $_ }
+          if (-not $found) {
+            $found = @(
+              Get-ChildItem "$env:APPDATA\Fury" -Recurse -Filter chrome.exe -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
+              Get-ChildItem "$env:LOCALAPPDATA\PiBrowse" -Recurse -Filter chrome.exe -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
+            ) | Where-Object { $_ }
+          }
+          if (-not $found) {
+            Write-Error "core chrome.exe not found after install-core (checked %APPDATA%\Fury\core.bundle and %LOCALAPPDATA%\PiBrowse)"
+          }
+          Write-Host "core found at: $($found -join ', ')"
+          & "$env:LOCALAPPDATA\PiBrowse\fury-agent.exe" install-core 2>&1 | Out-File test-results/core-report.txt -Encoding utf8
+
+      # The repo's own Windows end-to-end test. It drives
+      # target\release\fury-agent.exe (the build-tree binary, NOT the
+      # installed app) with a private FURY_HOME, so it cannot disturb the
+      # real installation. -CoreArchive is what makes its core section
+      # actually run: without it that section always skips. It exits 1
+      # if any claim fails. Known gaps, recorded in the audit: it closes
+      # the browser with Stop-Process -Force, so the graceful WM_CLOSE
+      # shutdown path is NOT tested; and its pipe-owner claim only fails
+      # in an elevated shell (the runner logs whether it was elevated).
+      - name: Run tools/verify-windows.ps1
+        shell: pwsh
+        timeout-minutes: 15
+        run: |
+          powershell -ExecutionPolicy Bypass -File tools\verify-windows.ps1 -CoreArchive fury-core-0.5.3-windows-x64.tar.xz 2>&1 |
+            Tee-Object -FilePath test-results/verify-windows.log
+          if ($LASTEXITCODE -ne 0) { Write-Error "verify-windows.ps1 failed (see test-results/verify-windows.log)" }
+
+      # Shared helper for the steps below: one JSON-RPC call over the
+      # agent's named pipe (same framing as verify-windows.ps1: one JSON
+      # object per line in, one per line out). Fails the step when the
+      # pipe cannot be opened or the agent answers with err.
+      - name: Write the agent RPC helper
+        shell: pwsh
+        run: |
+          @'
+          # Usage: . .\test-results\agent-rpc.ps1 <pipe-name>
+          #   $r = Invoke-AgentRpc -Method "status" -Params @{}
+          #   $r.ok / $r.err  (the agent's response envelope)
+          param([string]$PipeName)
+          function Invoke-AgentRpc {
+            param([string]$Method, [object]$Params = @{}, [int]$Id = 1)
+            $client = New-Object System.IO.Pipes.NamedPipeClientStream('.', $PipeName, [System.IO.Pipes.PipeDirection]::InOut)
+            $client.Connect(10000)
+            $writer = New-Object System.IO.StreamWriter($client); $writer.AutoFlush = $true
+            $reader = New-Object System.IO.StreamReader($client)
+            $body = @{ id = $Id; method = $Method; params = $Params } | ConvertTo-Json -Depth 10 -Compress
+            $writer.WriteLine($body)
+            $line = $reader.ReadLine()
+            $client.Dispose()
+            if (-not $line) { throw "no answer from agent for $Method" }
+            $resp = $line | ConvertFrom-Json
+            if ($resp.err) { throw "agent refused $Method : $($resp.err)" }
+            return $resp.ok
+          }
+          '@ | Out-File test-results/agent-rpc.ps1 -Encoding ascii
+
+      # Start the installed agent (default data directory, %APPDATA%\Fury)
+      # and discover the pipe it created. A background process started
+      # here survives into later steps of the same job.
+      - name: Start the installed agent
+        shell: pwsh
+        run: |
+          $before = @(Get-ChildItem \\.\pipe\ -ErrorAction SilentlyContinue | Where-Object { $_.Name -like 'fury-*' } | Select-Object -ExpandProperty Name)
+          $agent = Start-Process -FilePath "$env:LOCALAPPDATA\PiBrowse\fury-agent.exe" -ArgumentList 'serve' -PassThru -WindowStyle Hidden -RedirectStandardOutput test-results/agent-out.log -RedirectStandardError test-results/agent-err.log
+          $pipe = $null
+          for ($i = 0; $i -lt 100; $i++) {
+            Start-Sleep -Milliseconds 200
+            $pipe = Get-ChildItem \\.\pipe\ -ErrorAction SilentlyContinue | Where-Object { $_.Name -like 'fury-*' -and $before -notcontains $_.Name } | Select-Object -First 1
+            if ($pipe) { break }
+          }
+          if (-not $pipe) { Write-Error "installed agent never created a fury-* pipe (see test-results/agent-err.log)" }
+          $pipe.Name | Out-File test-results/pipe-name.txt -Encoding ascii
+          $agent.Id | Out-File test-results/agent-pid.txt -Encoding ascii
+          Write-Host "agent PID $($agent.Id) on pipe $($pipe.Name)"
+
+      # Create the test profile through the agent's own IPC, the same
+      # path the desktop shell uses (profiles.upsert). allow_no_proxy is
+      # deliberate: see the header. Persona is the Windows machine from
+      # the repo's catalogue; seed 0 means the store generates one.
+      - name: Create the test profile
+        shell: pwsh
+        run: |
+          $pipe = (Get-Content test-results/pipe-name.txt -Raw).Trim()
+          . .\test-results\agent-rpc.ps1 $pipe
+          $personas = Invoke-AgentRpc -Method "personas.list" -Id 1
+          if (-not ($personas | Where-Object { $_.id -eq $env:TEST_PERSONA })) {
+            Write-Error "persona $env:TEST_PERSONA not in personas.list"
+          }
+          $profile = @{
+            id = ""; project_id = $null; name = $env:TEST_PROFILE_NAME; notes = ""
+            tags = @("deep-test"); status = ""; persona_id = $env:TEST_PERSONA
+            fp_seed = 0; proxy = $null; proxy_id = $null
+            timezone = $null; languages = $null; overrides = @{}
+            start_urls = @(); allow_no_proxy = $true; last_opened_at = $null
+          }
+          $created = Invoke-AgentRpc -Method "profiles.upsert" -Params $profile -Id 2
+          if (-not $created.id) { Write-Error "profiles.upsert returned no id: $($created | ConvertTo-Json -Compress)" }
+          $created.id | Out-File test-results/profile-id.txt -Encoding ascii
+          $listed = Invoke-AgentRpc -Method "profiles.list" -Id 3
+          if (-not ($listed | Where-Object { $_.id -eq $created.id })) {
+            Write-Error "created profile $($created.id) not found in profiles.list"
+          }
+          Write-Host "profile created: $($created.id) ($env:TEST_PROFILE_NAME)"
+
+      # The local fingerprint probe. collector.py serves probe.html on
+      # 127.0.0.1:8731 and writes the dump to
+      # tools/detect-suite/baselines/<name>.json when the page POSTs it.
+      # The profile browser reaches it direct (no proxy), so loopback
+      # works. If the dump never lands, that is a real failure, not a
+      # skip: the probe is the release gate's own instrument.
+      - name: Start the detect-suite collector
+        shell: pwsh
+        run: |
+          $collector = Start-Process -FilePath python -ArgumentList "tools\detect-suite\collector.py" -PassThru -WindowStyle Hidden -RedirectStandardOutput test-results/collector-out.log -RedirectStandardError test-results/collector-err.log -WorkingDirectory $PWD
+          $collector.Id | Out-File test-results/collector-pid.txt -Encoding ascii
+          for ($i = 0; $i -lt 40; $i++) {
+            Start-Sleep -Milliseconds 500
+            try { Invoke-WebRequest -Uri "http://127.0.0.1:8731/probe.html" -UseBasicParsing -TimeoutSec 2 | Out-Null; break } catch { }
+            if ($i -eq 39) { Write-Error "collector did not answer on 127.0.0.1:8731 (see test-results/collector-err.log)" }
+          }
+          Write-Host "collector up (PID $($collector.Id))"
+
+      # Launch the stored profile with CDP on, then drive its browser
+      # with a small Node script over the CDP WebSocket (Node 22 has a
+      # built-in WebSocket client). The script: opens the local probe
+      # first (gating), then the public checkers (capture-only — see the
+      # header), screenshots each, and writes test-results/checkers.json.
+      # Any navigation, CDP or probe failure exits non-zero and fails
+      # the job; checker verdicts are recorded, never gated on.
+      - name: Launch the profile and drive its browser
+        shell: pwsh
+        timeout-minutes: 20
+        run: |
+          $pipe = (Get-Content test-results/pipe-name.txt -Raw).Trim()
+          . .\test-results\agent-rpc.ps1 $pipe
+          $profileId = (Get-Content test-results/profile-id.txt -Raw).Trim()
+          $launched = Invoke-AgentRpc -Method "profile.launch" -Params @{ id = $profileId; cdp = $true; background = $false } -Id 4
+          if (-not $launched.ws_endpoint) {
+            Write-Error "profile.launch returned no ws_endpoint (page tools unavailable): $($launched | ConvertTo-Json -Compress)"
+          }
+          @{ profileId = $profileId; wsEndpoint = $launched.ws_endpoint } | ConvertTo-Json -Compress |
+            Out-File test-results/cdp.json -Encoding ascii
+          Write-Host "profile launched, CDP at $($launched.ws_endpoint)"
+          @'
+          // CDP driver for the deep test. Node 22: global WebSocket, no deps.
+          // Reads test-results/cdp.json { wsEndpoint }, drives the profile's
+          // browser, writes test-results/checkers.json + screenshots.
+          // Exit code 1 on any navigation, CDP or probe failure. Checker
+          // verdicts are recorded, never gated on (datacenter IP, no proxy).
+          import fs from 'node:fs';
+          const { wsEndpoint } = JSON.parse(fs.readFileSync('test-results/cdp.json', 'utf8'));
+          const outDir = 'test-results';
+          const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+          const results = [];
+          let failed = false;
+          const fail = (site, msg) => { failed = true; results.push({ site, error: String(msg) }); console.error(`FAIL ${site}: ${msg}`); };
+          const ws = new WebSocket(wsEndpoint);
+          let nextId = 1;
+          const pending = new Map();
+          const events = [];
+          ws.onmessage = (ev) => {
+            const msg = JSON.parse(ev.data);
+            if (msg.id && pending.has(msg.id)) { pending.get(msg.id)(msg); pending.delete(msg.id); }
+            else if (msg.method) { events.push(msg); }
+          };
+          const call = (method, params = {}) => new Promise((resolve, reject) => {
+            const id = nextId++;
+            pending.set(id, (msg) => (msg.error ? reject(new Error(`${method}: ${JSON.stringify(msg.error)}`)) : resolve(msg.result)));
+            ws.send(JSON.stringify({ id, method, params }));
+            setTimeout(() => { if (pending.has(id)) { pending.delete(id); reject(new Error(`${method}: timed out`)); } }, 30000);
+          });
+          const evaluate = async (expr) => {
+            const r = await call('Runtime.evaluate', { expression: expr, returnByValue: true });
+            if (r.exceptionDetails) throw new Error(`evaluate failed: ${JSON.stringify(r.exceptionDetails).slice(0, 500)}`);
+            return r.result ? r.result.value : null;
+          };
+          const waitFor = async (fn, timeoutMs, what) => {
+            const end = Date.now() + timeoutMs;
+            while (Date.now() < end) { try { const v = await fn(); if (v) return v; } catch {} await sleep(1000); }
+            throw new Error(`timed out waiting for ${what}`);
+          };
+          const navigate = async (url) => {
+            events.length = 0;
+            await call('Page.navigate', { url });
+            await waitFor(async () => events.some((e) => e.method === 'Page.loadEventFired'), 60000, `load of ${url}`);
+            await sleep(3000);
+          };
+          const shot = async (name) => {
+            const r = await call('Page.captureScreenshot', { format: 'jpeg', quality: 70 });
+            fs.writeFileSync(`${outDir}/${name}.jpg`, Buffer.from(r.data, 'base64'));
+          };
+          const text = async () => (await evaluate('document.title + "\n" + document.body.innerText.slice(0, 6000)')) || '';
+          (async () => {
+            await new Promise((res, rej) => { ws.onopen = res; ws.onerror = rej; });
+            await call('Page.enable');
+            await call('Runtime.enable');
+            // 1. Local probe (gating): the page sets document.title to
+            // CAPTURE-OK once the collector saved the dump.
+            try {
+              await navigate('http://127.0.0.1:8731/probe.html?auto=deep-test-win');
+              const title = await waitFor(async () => {
+                const t = await evaluate('document.title');
+                return (t === 'CAPTURE-OK' || t === 'CAPTURE-FAIL') ? t : null;
+              }, 180000, 'probe capture');
+              if (title !== 'CAPTURE-OK') fail('local-probe', `probe page title is ${title}`);
+              else results.push({ site: 'local-probe', title, text: await text() });
+              await shot('probe');
+            } catch (e) { fail('local-probe', e.message); }
+            // 2. Public checkers (capture-only).
+            const checkers = [
+              ['pixelscan', 'https://pixelscan.net/', 25000],
+              ['browserleaks', 'https://browserleaks.com/', 15000],
+              ['creepjs', 'https://abrahamjuliot.github.io/creepjs/', 30000],
+              ['iphey', 'https://iphey.com/', 20000],
+            ];
+            for (const [name, url, waitMs] of checkers) {
+              try {
+                await navigate(url);
+                await sleep(waitMs);
+                const t = await text();
+                if (!t || t.trim().length < 20) throw new Error('page text empty after load');
+                results.push({ site: name, url, text: t });
+                await shot(name);
+              } catch (e) { fail(name, e.message); }
+            }
+            fs.writeFileSync(`${outDir}/checkers.json`, JSON.stringify(results, null, 2));
+            if (failed) { console.error('deep-test driver: one or more sites failed'); process.exit(1); }
+            console.log('deep-test driver: all sites captured');
+            process.exit(0);
+          })().catch((e) => { console.error(e); process.exit(1); });
+          '@ | Out-File cdp-driver.mjs -Encoding utf8
+          node cdp-driver.mjs
+          if ($LASTEXITCODE -ne 0) { Write-Error "CDP driver failed (see test-results/checkers.json for per-site results)" }
+
+      # Gate the captured dump: internal contradictions fail the job.
+      # The dump lands in tools/detect-suite/baselines/deep-test-win.json
+      # (the collector writes it there); copy it into test-results too.
+      - name: Gate the fingerprint dump
+        shell: pwsh
+        run: |
+          $dump = "tools\detect-suite\baselines\deep-test-win.json"
+          for ($i = 0; $i -lt 30; $i++) {
+            if (Test-Path $dump -and (Get-Item $dump).Length -gt 0) { break }
+            Start-Sleep -Seconds 2
+            if ($i -eq 29) { Write-Error "probe dump never appeared at $dump" }
+          }
+          Copy-Item $dump test-results/probe-dump.json
+          & .\target\release\fury-detect.exe gate $dump 2>&1 | Tee-Object -FilePath test-results/gate.log
+          if ($LASTEXITCODE -ne 0) { Write-Error "fury-detect gate failed (see test-results/gate.log)" }
+
+      # Compare against the committed real-Chrome Windows baseline.
+      # Values may differ (that is the spoofing working); behaviour may
+      # not. The tool exits non-zero when something that matters differs.
+      # NOTE: the tool also checks the probe version matches the baseline's;
+      # if it refuses on version alone, that is a finding about the
+      # baseline being stale, not a pass — do not weaken this step.
+      - name: Diff the dump against real Chrome
+        shell: pwsh
+        run: |
+          & .\target\release\fury-detect.exe diff --mode spoof tools\detect-suite\baselines\chrome-153-windows-x64-redacted.json tools\detect-suite\baselines\deep-test-win.json 2>&1 | Tee-Object -FilePath test-results/diff.log
+          if ($LASTEXITCODE -ne 0) { Write-Error "fury-detect diff --mode spoof failed (see test-results/diff.log)" }
+
+      # Close what the test opened, then stop the agent. Runs even if an
+      # earlier step failed, so a red run does not leave browsers behind.
+      - name: Close the profile and stop the agent
+        if: always()
+        shell: pwsh
+        run: |
+          $pipe = (Get-Content test-results/pipe-name.txt -Raw -ErrorAction SilentlyContinue).Trim()
+          if ($pipe) {
+            . .\test-results\agent-rpc.ps1 $pipe
+            $profileId = (Get-Content test-results/profile-id.txt -Raw -ErrorAction SilentlyContinue).Trim()
+            if ($profileId) {
+              try { Invoke-AgentRpc -Method "profile.stop" -Params @{ id = $profileId } -Id 9 | Out-Null; Write-Host "profile stopped" } catch { Write-Host "profile.stop failed (may already be closed): $_" }
+            }
+          }
+          Get-Process -Name fury-agent -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          Get-Process -Name chrome -ErrorAction SilentlyContinue | Where-Object { $_.Path -like '*Fury*' } | Stop-Process -Force -ErrorAction SilentlyContinue
+          $collectorPid = (Get-Content test-results/collector-pid.txt -Raw -ErrorAction SilentlyContinue).Trim()
+          if ($collectorPid) { Stop-Process -Id $collectorPid -Force -ErrorAction SilentlyContinue }
+
+      - name: Write the run summary
+        if: always()
+        shell: pwsh
+        run: |
+          @"
+          # PiBrowse Windows deep test — run summary
+          - Ref: ${{ inputs.ref }}, installer: ${{ steps.installer.outputs.name }} ($((Get-Content test-results/installer-sha256.txt -Raw).Trim()))
+          - Core: Fury 0.5.3, SHA-256 $env:CORE_SHA256 (verified in this run)
+          - verify-windows.ps1: see test-results/verify-windows.log
+          - Fingerprint gate: see test-results/gate.log; spoof diff: see test-results/diff.log
+          - Public checkers (capture-only, not gated): see test-results/checkers.json and the *.jpg screenshots
+          - Profile: $env:TEST_PROFILE_NAME, persona $env:TEST_PERSONA, no proxy (allow_no_proxy)
+          "@ | Out-File test-results/SUMMARY.md -Encoding utf8
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pibrowse-windows-deep-test-${{ steps.installer.outputs.version }}
+          path: test-results/
+          if-no-files-found: error
+          retention-days: 30
